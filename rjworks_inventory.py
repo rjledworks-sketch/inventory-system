@@ -14,7 +14,7 @@ def get_conn():
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL is missing in Render Environment Variables.")
-    return psycopg2.connect(database_url, sslmode="require")
+    return psycopg2.connect(database_url)
 
 
 def dict_cursor(conn):
