@@ -1,19 +1,28 @@
-from flask import Flask, request, redirect, url_for, render_template_string, send_file, flash
-import sqlite3
 import os
 import io
 import qrcode
+import psycopg2
+import psycopg2.extras
 from datetime import datetime
+from flask import Flask, request, redirect, url_for, render_template_string, send_file, flash
 
 app = Flask(__name__)
-app.secret_key = "inventory_secret_key"
-DB_NAME = "inventory.db"
+app.secret_key = os.environ.get("SECRET_KEY", "inventory_secret_key")
 
 
 def get_conn():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("DATABASE_URL is missing in Render Environment Variables.")
+    return psycopg2.connect(database_url, sslmode="require")
+
+
+def dict_cursor(conn):
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+
+def money(value):
+    return f"{float(value or 0):,.2f}"
 
 
 def init_db():
@@ -22,142 +31,152 @@ def init_db():
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         item_code TEXT UNIQUE NOT NULL,
         barcode_value TEXT UNIQUE NOT NULL,
         item_name TEXT NOT NULL,
         category TEXT,
         unit TEXT DEFAULT 'pcs',
-        default_cost REAL DEFAULT 0,
-        default_srp REAL DEFAULT 0,
-        reorder_level REAL DEFAULT 0,
+        default_cost NUMERIC(14,2) DEFAULT 0,
+        default_srp NUMERIC(14,2) DEFAULT 0,
+        reorder_level NUMERIC(14,2) DEFAULT 0,
         supplier TEXT,
-        is_active INTEGER DEFAULT 1,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS stock_layers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        item_id INTEGER NOT NULL,
+        id SERIAL PRIMARY KEY,
+        item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
         reference_no TEXT,
-        qty_received REAL NOT NULL,
-        qty_remaining REAL NOT NULL,
-        unit_cost REAL NOT NULL,
-        unit_srp REAL DEFAULT 0,
-        received_date TEXT NOT NULL,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(item_id) REFERENCES items(id)
+        qty_received NUMERIC(14,2) NOT NULL,
+        qty_remaining NUMERIC(14,2) NOT NULL,
+        unit_cost NUMERIC(14,2) NOT NULL,
+        unit_srp NUMERIC(14,2) DEFAULT 0,
+        received_date DATE NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS inventory_movements (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        item_id INTEGER NOT NULL,
-        movement_date TEXT NOT NULL,
+        id SERIAL PRIMARY KEY,
+        item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+        movement_date DATE NOT NULL,
         movement_type TEXT NOT NULL,
         reference_no TEXT,
-        qty_in REAL DEFAULT 0,
-        qty_out REAL DEFAULT 0,
-        unit_cost REAL DEFAULT 0,
-        unit_price REAL DEFAULT 0,
-        total_cost REAL DEFAULT 0,
-        total_sales REAL DEFAULT 0,
-        profit REAL DEFAULT 0,
+        qty_in NUMERIC(14,2) DEFAULT 0,
+        qty_out NUMERIC(14,2) DEFAULT 0,
+        unit_cost NUMERIC(14,2) DEFAULT 0,
+        unit_price NUMERIC(14,2) DEFAULT 0,
+        total_cost NUMERIC(14,2) DEFAULT 0,
+        total_sales NUMERIC(14,2) DEFAULT 0,
+        profit NUMERIC(14,2) DEFAULT 0,
         remarks TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(item_id) REFERENCES items(id)
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
     conn.commit()
+    cur.close()
     conn.close()
+
+
+def fetchone(query, params=None):
+    conn = get_conn()
+    cur = dict_cursor(conn)
+    cur.execute(query, params or ())
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row
+
+
+def fetchall(query, params=None):
+    conn = get_conn()
+    cur = dict_cursor(conn)
+    cur.execute(query, params or ())
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
 
 
 def generate_item_code():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) + 1 AS next_no FROM items")
-    next_no = cur.fetchone()["next_no"]
-    conn.close()
-    return f"ITM-{next_no:06d}"
+    row = fetchone("SELECT COUNT(*) + 1 AS next_no FROM items")
+    return f"ITM-{int(row['next_no']):06d}"
 
 
 def get_item_by_barcode(barcode):
-    conn = get_conn()
-    item = conn.execute("SELECT * FROM items WHERE barcode_value = ?", (barcode,)).fetchone()
-    conn.close()
-    return item
+    return fetchone("SELECT * FROM items WHERE barcode_value = %s", (barcode,))
 
 
 def get_stock_qty(item_id):
-    conn = get_conn()
-    row = conn.execute("""
+    row = fetchone("""
         SELECT COALESCE(SUM(qty_remaining), 0) AS qty
         FROM stock_layers
-        WHERE item_id = ?
-    """, (item_id,)).fetchone()
-    conn.close()
-    return row["qty"] if row else 0
+        WHERE item_id = %s
+    """, (item_id,))
+    return float(row["qty"] or 0)
 
 
 def compute_dashboard():
-    conn = get_conn()
+    total_items = fetchone("""
+        SELECT COUNT(*) AS c 
+        FROM items 
+        WHERE is_active = TRUE
+    """)["c"]
 
-    total_items = conn.execute("SELECT COUNT(*) AS c FROM items WHERE is_active = 1").fetchone()["c"]
-
-    stock_value = conn.execute("""
+    stock_value = fetchone("""
         SELECT COALESCE(SUM(qty_remaining * unit_cost), 0) AS v
         FROM stock_layers
-    """).fetchone()["v"]
+    """)["v"]
 
-    srp_value = conn.execute("""
+    srp_value = fetchone("""
         SELECT COALESCE(SUM(sl.qty_remaining * COALESCE(i.default_srp, sl.unit_srp)), 0) AS v
         FROM stock_layers sl
         JOIN items i ON i.id = sl.item_id
-    """).fetchone()["v"]
+    """)["v"]
 
-    total_sales = conn.execute("""
+    total_sales = fetchone("""
         SELECT COALESCE(SUM(total_sales), 0) AS v
         FROM inventory_movements
         WHERE movement_type = 'SALE'
-    """).fetchone()["v"]
+    """)["v"]
 
-    total_cost = conn.execute("""
+    total_cost = fetchone("""
         SELECT COALESCE(SUM(total_cost), 0) AS v
         FROM inventory_movements
         WHERE movement_type = 'SALE'
-    """).fetchone()["v"]
+    """)["v"]
 
-    total_profit = conn.execute("""
+    total_profit = fetchone("""
         SELECT COALESCE(SUM(profit), 0) AS v
         FROM inventory_movements
         WHERE movement_type = 'SALE'
-    """).fetchone()["v"]
+    """)["v"]
 
-    low_stock = conn.execute("""
+    low_stock = fetchone("""
         SELECT COUNT(*) AS c
         FROM items i
-        WHERE i.is_active = 1
+        WHERE i.is_active = TRUE
         AND (
             SELECT COALESCE(SUM(qty_remaining), 0)
             FROM stock_layers sl
             WHERE sl.item_id = i.id
         ) <= i.reorder_level
-    """).fetchone()["c"]
-
-    conn.close()
+    """)["c"]
 
     return {
         "total_items": total_items,
-        "stock_value": stock_value,
-        "srp_value": srp_value,
-        "potential_profit": srp_value - stock_value,
-        "total_sales": total_sales,
-        "total_cost": total_cost,
-        "total_profit": total_profit,
+        "stock_value": float(stock_value or 0),
+        "srp_value": float(srp_value or 0),
+        "potential_profit": float(srp_value or 0) - float(stock_value or 0),
+        "total_sales": float(total_sales or 0),
+        "total_cost": float(total_cost or 0),
+        "total_profit": float(total_profit or 0),
         "low_stock": low_stock
     }
 
@@ -166,213 +185,77 @@ BASE_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Inventory System</title>
+    <title>RJ LEDWORKS Inventory</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
 
     <style>
-        * {
-            box-sizing: border-box;
-            font-family: Arial, sans-serif;
-        }
-
-        body {
-            margin: 0;
-            background: #f3f6f4;
-            color: #1f2937;
-        }
-
-        .layout {
-            display: flex;
-            min-height: 100vh;
-        }
-
+        * { box-sizing: border-box; font-family: Arial, sans-serif; }
+        body { margin: 0; background: #f3f6f4; color: #1f2937; }
+        .layout { display: flex; min-height: 100vh; }
         .sidebar {
-            width: 240px;
-            background: #12372a;
-            color: white;
-            padding: 20px;
-            position: fixed;
-            top: 0;
-            bottom: 0;
-            left: 0;
+            width: 240px; background: #12372a; color: white; padding: 20px;
+            position: fixed; top: 0; bottom: 0; left: 0;
         }
-
-        .brand {
-            font-size: 20px;
-            font-weight: bold;
-            margin-bottom: 28px;
-        }
-
+        .brand { font-size: 20px; font-weight: bold; margin-bottom: 28px; }
         .nav a {
-            display: block;
-            color: #d1fae5;
-            text-decoration: none;
-            padding: 12px;
-            border-radius: 10px;
-            margin-bottom: 8px;
+            display: block; color: #d1fae5; text-decoration: none;
+            padding: 12px; border-radius: 10px; margin-bottom: 8px;
         }
-
-        .nav a:hover {
-            background: #1f5c45;
-        }
-
-        .main {
-            margin-left: 240px;
-            padding: 24px;
-            width: calc(100% - 240px);
-        }
-
+        .nav a:hover { background: #1f5c45; }
+        .main { margin-left: 240px; padding: 24px; width: calc(100% - 240px); }
         .topbar {
-            background: white;
-            padding: 18px 22px;
-            border-radius: 16px;
-            margin-bottom: 20px;
-            box-shadow: 0 4px 14px rgba(0,0,0,.05);
+            background: white; padding: 18px 22px; border-radius: 16px;
+            margin-bottom: 20px; box-shadow: 0 4px 14px rgba(0,0,0,.05);
         }
-
-        h1 {
-            margin: 0;
-            font-size: 24px;
-        }
-
-        .sub {
-            color: #6b7280;
-            margin-top: 5px;
-        }
-
+        h1 { margin: 0; font-size: 24px; }
+        .sub { color: #6b7280; margin-top: 5px; }
         .cards {
-            display: grid;
-            grid-template-columns: repeat(4, minmax(160px, 1fr));
-            gap: 14px;
-            margin-bottom: 20px;
+            display: grid; grid-template-columns: repeat(4, minmax(160px, 1fr));
+            gap: 14px; margin-bottom: 20px;
         }
-
         .card {
-            background: white;
-            padding: 18px;
-            border-radius: 16px;
+            background: white; padding: 18px; border-radius: 16px;
             box-shadow: 0 4px 14px rgba(0,0,0,.05);
         }
-
-        .card .label {
-            color: #6b7280;
-            font-size: 13px;
-        }
-
-        .card .value {
-            font-size: 22px;
-            font-weight: bold;
-            margin-top: 8px;
-        }
-
+        .card .label { color: #6b7280; font-size: 13px; }
+        .card .value { font-size: 22px; font-weight: bold; margin-top: 8px; }
         .panel {
-            background: white;
-            padding: 20px;
-            border-radius: 16px;
-            box-shadow: 0 4px 14px rgba(0,0,0,.05);
-            margin-bottom: 20px;
+            background: white; padding: 20px; border-radius: 16px;
+            box-shadow: 0 4px 14px rgba(0,0,0,.05); margin-bottom: 20px;
+            overflow-x: auto;
         }
-
-        .form-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 14px;
-        }
-
-        label {
-            font-size: 13px;
-            color: #374151;
-            font-weight: bold;
-        }
-
+        .form-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+        label { font-size: 13px; color: #374151; font-weight: bold; }
         input, select, textarea {
-            width: 100%;
-            padding: 10px 12px;
-            border: 1px solid #d1d5db;
-            border-radius: 10px;
-            margin-top: 5px;
+            width: 100%; padding: 10px 12px; border: 1px solid #d1d5db;
+            border-radius: 10px; margin-top: 5px;
         }
-
         button, .btn {
-            background: #166534;
-            color: white;
-            border: 0;
-            padding: 10px 14px;
-            border-radius: 10px;
-            cursor: pointer;
-            text-decoration: none;
-            display: inline-block;
-            font-size: 14px;
+            background: #166534; color: white; border: 0; padding: 10px 14px;
+            border-radius: 10px; cursor: pointer; text-decoration: none;
+            display: inline-block; font-size: 14px;
         }
-
-        button:hover, .btn:hover {
-            background: #14532d;
-        }
-
-        .btn-light {
-            background: #e5e7eb;
-            color: #111827;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 14px;
-        }
-
+        button:hover, .btn:hover { background: #14532d; }
+        .btn-light { background: #e5e7eb; color: #111827; }
+        table { width: 100%; border-collapse: collapse; font-size: 14px; min-width: 900px; }
         th {
-            background: #ecfdf5;
-            text-align: left;
-            padding: 10px;
+            background: #ecfdf5; text-align: left; padding: 10px;
             border-bottom: 1px solid #d1d5db;
         }
-
-        td {
-            padding: 10px;
-            border-bottom: 1px solid #e5e7eb;
-        }
-
-        .right {
-            text-align: right;
-        }
-
+        td { padding: 10px; border-bottom: 1px solid #e5e7eb; }
+        .right { text-align: right; }
         .flash {
-            background: #dcfce7;
-            color: #166534;
-            padding: 12px;
-            border-radius: 10px;
-            margin-bottom: 14px;
+            background: #dcfce7; color: #166534; padding: 12px;
+            border-radius: 10px; margin-bottom: 14px;
         }
-
-        .danger {
-            color: #b91c1c;
-            font-weight: bold;
-        }
-
-        .scanner-box {
-            max-width: 420px;
-            margin-top: 15px;
-        }
+        .danger { color: #b91c1c; font-weight: bold; }
+        .scanner-box { max-width: 420px; margin-top: 15px; }
 
         @media(max-width: 900px) {
-            .sidebar {
-                position: relative;
-                width: 100%;
-                height: auto;
-            }
-
-            .layout {
-                display: block;
-            }
-
-            .main {
-                margin-left: 0;
-                width: 100%;
-            }
-
-            .cards, .form-grid {
-                grid-template-columns: 1fr;
-            }
+            .sidebar { position: relative; width: 100%; height: auto; }
+            .layout { display: block; }
+            .main { margin-left: 0; width: 100%; padding: 14px; }
+            .cards, .form-grid { grid-template-columns: 1fr; }
         }
     </style>
 </head>
@@ -380,7 +263,7 @@ BASE_HTML = """
 <body>
 <div class="layout">
     <aside class="sidebar">
-        <div class="brand">Inventory System</div>
+        <div class="brand">RJ LEDWORKS Inventory</div>
         <div class="nav">
             <a href="{{ url_for('dashboard') }}">Dashboard</a>
             <a href="{{ url_for('items') }}">Item Master</a>
@@ -418,7 +301,7 @@ def page(title, subtitle, content, **kwargs):
         BASE_HTML,
         title=title,
         subtitle=subtitle,
-        content=render_template_string(content, **kwargs)
+        content=render_template_string(content, money=money, **kwargs)
     )
 
 
@@ -429,15 +312,15 @@ def dashboard():
     content = """
     <div class="cards">
         <div class="card"><div class="label">Total Items</div><div class="value">{{ d.total_items }}</div></div>
-        <div class="card"><div class="label">Inventory Cost</div><div class="value">₱{{ "{:,.2f}".format(d.stock_value) }}</div></div>
-        <div class="card"><div class="label">Inventory at SRP</div><div class="value">₱{{ "{:,.2f}".format(d.srp_value) }}</div></div>
-        <div class="card"><div class="label">Potential Profit</div><div class="value">₱{{ "{:,.2f}".format(d.potential_profit) }}</div></div>
+        <div class="card"><div class="label">Inventory Cost</div><div class="value">₱{{ money(d.stock_value) }}</div></div>
+        <div class="card"><div class="label">Inventory at SRP</div><div class="value">₱{{ money(d.srp_value) }}</div></div>
+        <div class="card"><div class="label">Potential Profit</div><div class="value">₱{{ money(d.potential_profit) }}</div></div>
     </div>
 
     <div class="cards">
-        <div class="card"><div class="label">Actual Sales</div><div class="value">₱{{ "{:,.2f}".format(d.total_sales) }}</div></div>
-        <div class="card"><div class="label">Cost of Sales</div><div class="value">₱{{ "{:,.2f}".format(d.total_cost) }}</div></div>
-        <div class="card"><div class="label">Actual Profit</div><div class="value">₱{{ "{:,.2f}".format(d.total_profit) }}</div></div>
+        <div class="card"><div class="label">Actual Sales</div><div class="value">₱{{ money(d.total_sales) }}</div></div>
+        <div class="card"><div class="label">Cost of Sales</div><div class="value">₱{{ money(d.total_cost) }}</div></div>
+        <div class="card"><div class="label">Actual Profit</div><div class="value">₱{{ money(d.total_profit) }}</div></div>
         <div class="card"><div class="label">Low Stock Items</div><div class="value">{{ d.low_stock }}</div></div>
     </div>
     """
@@ -446,19 +329,19 @@ def dashboard():
 
 @app.route("/items", methods=["GET", "POST"])
 def items():
-    conn = get_conn()
-
     if request.method == "POST":
         item_code = request.form.get("item_code") or generate_item_code()
         barcode_value = item_code
 
         try:
-            conn.execute("""
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("""
                 INSERT INTO items (
                     item_code, barcode_value, item_name, category, unit,
                     default_cost, default_srp, reorder_level, supplier
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 item_code,
                 barcode_value,
@@ -471,58 +354,34 @@ def items():
                 request.form.get("supplier")
             ))
             conn.commit()
+            cur.close()
+            conn.close()
             flash("Item saved successfully.")
-        except sqlite3.IntegrityError:
-            flash("Item code already exists.")
+        except Exception as e:
+            flash(f"Unable to save item: {e}")
 
-        conn.close()
         return redirect(url_for("items"))
 
-    rows = conn.execute("""
+    rows = fetchall("""
         SELECT i.*,
         COALESCE((SELECT SUM(qty_remaining) FROM stock_layers sl WHERE sl.item_id = i.id), 0) AS stock_qty
         FROM items i
-        WHERE i.is_active = 1
+        WHERE i.is_active = TRUE
         ORDER BY i.item_name
-    """).fetchall()
-    conn.close()
+    """)
 
     content = """
     <div class="panel">
         <form method="POST">
             <div class="form-grid">
-                <div>
-                    <label>Item Code</label>
-                    <input name="item_code" placeholder="Auto if blank">
-                </div>
-                <div>
-                    <label>Item Name</label>
-                    <input name="item_name" required>
-                </div>
-                <div>
-                    <label>Category</label>
-                    <input name="category">
-                </div>
-                <div>
-                    <label>Unit</label>
-                    <input name="unit" value="pcs">
-                </div>
-                <div>
-                    <label>Default Cost</label>
-                    <input name="default_cost" type="number" step="0.01">
-                </div>
-                <div>
-                    <label>Default SRP</label>
-                    <input name="default_srp" type="number" step="0.01">
-                </div>
-                <div>
-                    <label>Reorder Level</label>
-                    <input name="reorder_level" type="number" step="0.01">
-                </div>
-                <div>
-                    <label>Supplier</label>
-                    <input name="supplier">
-                </div>
+                <div><label>Item Code</label><input name="item_code" placeholder="Auto if blank"></div>
+                <div><label>Item Name</label><input name="item_name" required></div>
+                <div><label>Category</label><input name="category"></div>
+                <div><label>Unit</label><input name="unit" value="pcs"></div>
+                <div><label>Default Cost</label><input name="default_cost" type="number" step="0.01"></div>
+                <div><label>Default SRP</label><input name="default_srp" type="number" step="0.01"></div>
+                <div><label>Reorder Level</label><input name="reorder_level" type="number" step="0.01"></div>
+                <div><label>Supplier</label><input name="supplier"></div>
             </div>
             <br>
             <button type="submit">Save Item</button>
@@ -550,9 +409,9 @@ def items():
                     <td>{{ r.item_name }}</td>
                     <td>{{ r.category or "" }}</td>
                     <td>{{ r.unit }}</td>
-                    <td class="right">{{ "{:,.2f}".format(r.stock_qty) }}</td>
-                    <td class="right">₱{{ "{:,.2f}".format(r.default_cost) }}</td>
-                    <td class="right">₱{{ "{:,.2f}".format(r.default_srp) }}</td>
+                    <td class="right">{{ money(r.stock_qty) }}</td>
+                    <td class="right">₱{{ money(r.default_cost) }}</td>
+                    <td class="right">₱{{ money(r.default_srp) }}</td>
                     <td><a class="btn btn-light" href="{{ url_for('qr_code', item_id=r.id) }}" target="_blank">QR</a></td>
                 </tr>
                 {% endfor %}
@@ -565,9 +424,7 @@ def items():
 
 @app.route("/qr/<int:item_id>")
 def qr_code(item_id):
-    conn = get_conn()
-    item = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
-    conn.close()
+    item = fetchone("SELECT * FROM items WHERE id = %s", (item_id,))
 
     if not item:
         return "Item not found", 404
@@ -582,7 +439,7 @@ def qr_code(item_id):
 
 @app.route("/stock-in", methods=["GET", "POST"])
 def stock_in():
-    conn = get_conn()
+    selected_barcode = request.args.get("barcode", "")
 
     if request.method == "POST":
         barcode = request.form.get("barcode_value")
@@ -603,32 +460,36 @@ def stock_in():
             flash("Quantity must be greater than zero.")
             return redirect(url_for("stock_in"))
 
-        conn.execute("""
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
             INSERT INTO stock_layers (
                 item_id, reference_no, qty_received, qty_remaining,
                 unit_cost, unit_srp, received_date
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (item["id"], ref, qty, qty, unit_cost, unit_srp, date))
 
-        conn.execute("""
+        cur.execute("""
             INSERT INTO inventory_movements (
                 item_id, movement_date, movement_type, reference_no,
                 qty_in, unit_cost, unit_price, total_cost, remarks
             )
-            VALUES (?, ?, 'IN', ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, 'IN', %s, %s, %s, %s, %s, %s)
         """, (
             item["id"], date, ref, qty, unit_cost, unit_srp,
             qty * unit_cost, remarks
         ))
 
         conn.commit()
+        cur.close()
         conn.close()
+
         flash("Stock In saved successfully.")
         return redirect(url_for("stock_in"))
 
-    items = conn.execute("SELECT * FROM items WHERE is_active = 1 ORDER BY item_name").fetchall()
-    conn.close()
+    items = fetchall("SELECT * FROM items WHERE is_active = TRUE ORDER BY item_name")
 
     content = """
     <div class="panel">
@@ -639,42 +500,20 @@ def stock_in():
                     <select name="barcode_value" required onchange="fillDefaults(this)">
                         <option value="">Select item</option>
                         {% for i in items %}
-                        <option value="{{ i.barcode_value }}" data-cost="{{ i.default_cost }}" data-srp="{{ i.default_srp }}">
+                        <option value="{{ i.barcode_value }}" data-cost="{{ i.default_cost }}" data-srp="{{ i.default_srp }}"
+                            {% if selected_barcode == i.barcode_value %}selected{% endif %}>
                             {{ i.item_code }} - {{ i.item_name }}
                         </option>
                         {% endfor %}
                     </select>
                 </div>
 
-                <div>
-                    <label>Date</label>
-                    <input type="date" name="movement_date" value="{{ today }}">
-                </div>
-
-                <div>
-                    <label>Reference No.</label>
-                    <input name="reference_no">
-                </div>
-
-                <div>
-                    <label>Qty In</label>
-                    <input type="number" step="0.01" name="qty" required>
-                </div>
-
-                <div>
-                    <label>Actual Unit Cost</label>
-                    <input type="number" step="0.01" name="unit_cost" id="unit_cost" required>
-                </div>
-
-                <div>
-                    <label>SRP</label>
-                    <input type="number" step="0.01" name="unit_srp" id="unit_srp">
-                </div>
-
-                <div style="grid-column: 1 / -1;">
-                    <label>Remarks</label>
-                    <textarea name="remarks"></textarea>
-                </div>
+                <div><label>Date</label><input type="date" name="movement_date" value="{{ today }}"></div>
+                <div><label>Reference No.</label><input name="reference_no"></div>
+                <div><label>Qty In</label><input type="number" step="0.01" name="qty" required></div>
+                <div><label>Actual Unit Cost</label><input type="number" step="0.01" name="unit_cost" id="unit_cost" required></div>
+                <div><label>SRP</label><input type="number" step="0.01" name="unit_srp" id="unit_srp"></div>
+                <div style="grid-column: 1 / -1;"><label>Remarks</label><textarea name="remarks"></textarea></div>
             </div>
             <br>
             <button type="submit">Save Stock In</button>
@@ -687,14 +526,26 @@ def stock_in():
             document.getElementById("unit_cost").value = opt.dataset.cost || 0;
             document.getElementById("unit_srp").value = opt.dataset.srp || 0;
         }
+
+        window.onload = function() {
+            const sel = document.querySelector("select[name='barcode_value']");
+            if (sel && sel.value) fillDefaults(sel);
+        }
     </script>
     """
-    return page("Stock In", "Record incoming inventory with actual cost", content, items=items, today=datetime.now().strftime("%Y-%m-%d"))
+    return page(
+        "Stock In",
+        "Record incoming inventory with actual cost",
+        content,
+        items=items,
+        selected_barcode=selected_barcode,
+        today=datetime.now().strftime("%Y-%m-%d")
+    )
 
 
 @app.route("/sale", methods=["GET", "POST"])
 def sale():
-    conn = get_conn()
+    selected_barcode = request.args.get("barcode", "")
 
     if request.method == "POST":
         barcode = request.form.get("barcode_value")
@@ -720,28 +571,34 @@ def sale():
             flash(f"Insufficient stock. Available only: {available:,.2f}")
             return redirect(url_for("sale"))
 
+        conn = get_conn()
+        cur = dict_cursor(conn)
+
         remaining_to_issue = qty_needed
         total_cost = 0
 
-        layers = conn.execute("""
+        cur.execute("""
             SELECT *
             FROM stock_layers
-            WHERE item_id = ? AND qty_remaining > 0
+            WHERE item_id = %s AND qty_remaining > 0
             ORDER BY received_date ASC, id ASC
-        """, (item["id"],)).fetchall()
+        """, (item["id"],))
+
+        layers = cur.fetchall()
 
         for layer in layers:
             if remaining_to_issue <= 0:
                 break
 
-            take_qty = min(remaining_to_issue, layer["qty_remaining"])
-            cost_part = take_qty * layer["unit_cost"]
-            total_cost += cost_part
+            layer_remaining = float(layer["qty_remaining"])
+            layer_cost = float(layer["unit_cost"])
+            take_qty = min(remaining_to_issue, layer_remaining)
+            total_cost += take_qty * layer_cost
 
-            conn.execute("""
+            cur.execute("""
                 UPDATE stock_layers
-                SET qty_remaining = qty_remaining - ?
-                WHERE id = ?
+                SET qty_remaining = qty_remaining - %s
+                WHERE id = %s
             """, (take_qty, layer["id"]))
 
             remaining_to_issue -= take_qty
@@ -750,31 +607,32 @@ def sale():
         profit = total_sales - total_cost
         avg_cost_basis = total_cost / qty_needed if qty_needed else 0
 
-        conn.execute("""
+        cur.execute("""
             INSERT INTO inventory_movements (
                 item_id, movement_date, movement_type, reference_no,
                 qty_out, unit_cost, unit_price,
                 total_cost, total_sales, profit, remarks
             )
-            VALUES (?, ?, 'SALE', ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, 'SALE', %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             item["id"], date, ref, qty_needed, avg_cost_basis, selling_price,
             total_cost, total_sales, profit, remarks
         ))
 
         conn.commit()
+        cur.close()
         conn.close()
+
         flash(f"Sale saved. Profit: ₱{profit:,.2f}")
         return redirect(url_for("sale"))
 
-    items = conn.execute("""
+    items = fetchall("""
         SELECT i.*,
         COALESCE((SELECT SUM(qty_remaining) FROM stock_layers sl WHERE sl.item_id = i.id), 0) AS stock_qty
         FROM items i
-        WHERE i.is_active = 1
+        WHERE i.is_active = TRUE
         ORDER BY i.item_name
-    """).fetchall()
-    conn.close()
+    """)
 
     content = """
     <div class="panel">
@@ -785,42 +643,20 @@ def sale():
                     <select name="barcode_value" required onchange="fillSaleDefaults(this)">
                         <option value="">Select item</option>
                         {% for i in items %}
-                        <option value="{{ i.barcode_value }}" data-srp="{{ i.default_srp }}" data-stock="{{ i.stock_qty }}">
-                            {{ i.item_code }} - {{ i.item_name }} | Stock: {{ "{:,.2f}".format(i.stock_qty) }}
+                        <option value="{{ i.barcode_value }}" data-srp="{{ i.default_srp }}" data-stock="{{ i.stock_qty }}"
+                            {% if selected_barcode == i.barcode_value %}selected{% endif %}>
+                            {{ i.item_code }} - {{ i.item_name }} | Stock: {{ money(i.stock_qty) }}
                         </option>
                         {% endfor %}
                     </select>
                 </div>
 
-                <div>
-                    <label>Date</label>
-                    <input type="date" name="movement_date" value="{{ today }}">
-                </div>
-
-                <div>
-                    <label>Sales / Reference No.</label>
-                    <input name="reference_no">
-                </div>
-
-                <div>
-                    <label>Qty Out / Sold</label>
-                    <input type="number" step="0.01" name="qty" required>
-                </div>
-
-                <div>
-                    <label>Selling Price</label>
-                    <input type="number" step="0.01" name="selling_price" id="selling_price" required>
-                </div>
-
-                <div>
-                    <label>Available Stock</label>
-                    <input id="available_stock" readonly>
-                </div>
-
-                <div style="grid-column: 1 / -1;">
-                    <label>Remarks</label>
-                    <textarea name="remarks"></textarea>
-                </div>
+                <div><label>Date</label><input type="date" name="movement_date" value="{{ today }}"></div>
+                <div><label>Sales / Reference No.</label><input name="reference_no"></div>
+                <div><label>Qty Out / Sold</label><input type="number" step="0.01" name="qty" required></div>
+                <div><label>Selling Price</label><input type="number" step="0.01" name="selling_price" id="selling_price" required></div>
+                <div><label>Available Stock</label><input id="available_stock" readonly></div>
+                <div style="grid-column: 1 / -1;"><label>Remarks</label><textarea name="remarks"></textarea></div>
             </div>
             <br>
             <button type="submit">Save Sale / Stock Out</button>
@@ -833,9 +669,21 @@ def sale():
             document.getElementById("selling_price").value = opt.dataset.srp || 0;
             document.getElementById("available_stock").value = opt.dataset.stock || 0;
         }
+
+        window.onload = function() {
+            const sel = document.querySelector("select[name='barcode_value']");
+            if (sel && sel.value) fillSaleDefaults(sel);
+        }
     </script>
     """
-    return page("Sales / Stock Out", "Record actual sale and compute FIFO profit", content, items=items, today=datetime.now().strftime("%Y-%m-%d"))
+    return page(
+        "Sales / Stock Out",
+        "Record actual sale and compute FIFO profit",
+        content,
+        items=items,
+        selected_barcode=selected_barcode,
+        today=datetime.now().strftime("%Y-%m-%d")
+    )
 
 
 @app.route("/scan")
@@ -883,15 +731,13 @@ def scan():
 
 @app.route("/movements")
 def movements():
-    conn = get_conn()
-    rows = conn.execute("""
+    rows = fetchall("""
         SELECT m.*, i.item_code, i.item_name
         FROM inventory_movements m
         JOIN items i ON i.id = m.item_id
         ORDER BY m.movement_date DESC, m.id DESC
         LIMIT 200
-    """).fetchall()
-    conn.close()
+    """)
 
     content = """
     <div class="panel">
@@ -918,13 +764,13 @@ def movements():
                     <td>{{ r.movement_type }}</td>
                     <td>{{ r.reference_no or "" }}</td>
                     <td>{{ r.item_code }} - {{ r.item_name }}</td>
-                    <td class="right">{{ "{:,.2f}".format(r.qty_in or 0) }}</td>
-                    <td class="right">{{ "{:,.2f}".format(r.qty_out or 0) }}</td>
-                    <td class="right">₱{{ "{:,.2f}".format(r.unit_cost or 0) }}</td>
-                    <td class="right">₱{{ "{:,.2f}".format(r.unit_price or 0) }}</td>
-                    <td class="right">₱{{ "{:,.2f}".format(r.total_cost or 0) }}</td>
-                    <td class="right">₱{{ "{:,.2f}".format(r.total_sales or 0) }}</td>
-                    <td class="right">₱{{ "{:,.2f}".format(r.profit or 0) }}</td>
+                    <td class="right">{{ money(r.qty_in) }}</td>
+                    <td class="right">{{ money(r.qty_out) }}</td>
+                    <td class="right">₱{{ money(r.unit_cost) }}</td>
+                    <td class="right">₱{{ money(r.unit_price) }}</td>
+                    <td class="right">₱{{ money(r.total_cost) }}</td>
+                    <td class="right">₱{{ money(r.total_sales) }}</td>
+                    <td class="right">₱{{ money(r.profit) }}</td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -934,6 +780,12 @@ def movements():
     return page("Movement History", "Latest 200 stock and sales transactions", content, rows=rows)
 
 
-if __name__ == "__main__":
+try:
     init_db()
-    app.run(debug=True, port=5010)
+except Exception as e:
+    print("Database init error:", e)
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5010))
+    app.run(debug=True, host="0.0.0.0", port=port)
